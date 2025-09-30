@@ -6,7 +6,7 @@
 //!
 //! ## Quick Start
 //!
-//! The simplest way to use this SDK is with the [`query`] function:
+//! The simplest way to use this SDK is with the [`query()`] function:
 //!
 //! ```no_run
 //! use claude_agent_sdk::query;
@@ -168,7 +168,7 @@
 //! The SDK is organized into several key modules:
 //!
 //! - [`types`]: Core type definitions, newtypes, and builders
-//! - [`query`]: Simple one-shot query function
+//! - [`query()`]: Simple one-shot query function
 //! - [`client`]: Interactive bidirectional client
 //! - [`mcp`]: SDK MCP server for custom tools
 //! - [`hooks`]: Hook system for intercepting events
