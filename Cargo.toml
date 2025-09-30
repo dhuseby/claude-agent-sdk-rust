@@ -1,6 +1,6 @@
 [package]
 name = "claude-agent-sdk"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Anthropic <support@anthropic.com>"]
 description = "Idiomatic Rust SDK for building AI agents powered by Claude Code with full async support, type safety, and security hardening"
