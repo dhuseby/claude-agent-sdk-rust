@@ -3,7 +3,6 @@
 //! This module provides the permission system for controlling which tools
 //! Claude can use and with what parameters.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -85,7 +84,9 @@ impl PermissionManager {
         if let Some(ref callback) = self.callback {
             callback(tool_name, tool_input, context).await
         } else {
-            // Default: allow
+            // If there's an allowed_tools list and we've passed the check, allow it
+            // Otherwise, default to allow for backward compatibility
+            // Note: For stricter security, consider changing this to deny-by-default
             Ok(PermissionResult::Allow(PermissionResultAllow {
                 updated_input: None,
                 updated_permissions: None,
@@ -163,7 +164,6 @@ impl Default for PermissionManagerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::PermissionUpdate;
 
     #[tokio::test]
     async fn test_permission_manager_default_allow() {

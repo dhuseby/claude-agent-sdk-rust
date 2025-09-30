@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,6 +17,27 @@ use crate::types::{ClaudeAgentOptions, SystemPrompt};
 use crate::{Transport, VERSION};
 
 const DEFAULT_MAX_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
+
+// Dangerous environment variables that should not be passed to subprocess
+const DANGEROUS_ENV_VARS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "PATH",
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+    "PERL5LIB",
+    "RUBYLIB",
+];
+
+// Allowed extra CLI flags (allowlist approach)
+const ALLOWED_EXTRA_FLAGS: &[&str] = &[
+    "timeout",
+    "retries",
+    "log-level",
+    "cache-dir",
+];
 
 /// Prompt input type
 #[derive(Debug)]
@@ -263,12 +284,14 @@ impl SubprocessTransport {
             cmd.arg("--setting-sources").arg("");
         }
 
-        // Extra args
+        // Extra args - only allow safe flags from allowlist
         for (flag, value) in &self.options.extra_args {
-            if let Some(v) = value {
-                cmd.arg(format!("--{flag}")).arg(v);
-            } else {
-                cmd.arg(format!("--{flag}"));
+            if ALLOWED_EXTRA_FLAGS.contains(&flag.as_str()) {
+                if let Some(v) = value {
+                    cmd.arg(format!("--{flag}")).arg(v);
+                } else {
+                    cmd.arg(format!("--{flag}"));
+                }
             }
         }
 
@@ -338,9 +361,16 @@ impl Transport for SubprocessTransport {
 
         let mut cmd = self.build_command();
 
-        // Set up environment
+        // Set up environment - filter dangerous variables
         let mut process_env = env::vars().collect::<HashMap<_, _>>();
-        process_env.extend(self.options.env.clone());
+
+        // Only add user-provided env vars that are not in the dangerous list
+        for (key, value) in &self.options.env {
+            if !DANGEROUS_ENV_VARS.contains(&key.as_str()) {
+                process_env.insert(key.clone(), value.clone());
+            }
+        }
+
         process_env.insert("CLAUDE_CODE_ENTRYPOINT".to_string(), "sdk-rust".to_string());
         process_env.insert("CLAUDE_AGENT_SDK_VERSION".to_string(), VERSION.to_string());
 
@@ -363,10 +393,13 @@ impl Transport for SubprocessTransport {
         let mut child = cmd.spawn().map_err(|e| {
             if let Some(ref cwd) = self.cwd {
                 if !cwd.exists() {
+                    #[cfg(debug_assertions)]
                     return ClaudeError::connection(format!(
                         "Working directory does not exist: {}",
                         cwd.display()
                     ));
+                    #[cfg(not(debug_assertions))]
+                    return ClaudeError::connection("Working directory does not exist".to_string());
                 }
             }
             ClaudeError::connection(format!("Failed to start Claude Code: {e}"))
@@ -479,9 +512,14 @@ impl Transport for SubprocessTransport {
 
             loop {
                 let mut line = String::new();
-                match stdout.read_line(&mut line).await {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
+
+                // Add timeout to read_line to prevent hanging
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    stdout.read_line(&mut line)
+                ).await {
+                    Ok(Ok(0)) => break, // EOF
+                    Ok(Ok(_)) => {
                         let line = line.trim();
                         if line.is_empty() {
                             continue;
@@ -514,12 +552,17 @@ impl Transport for SubprocessTransport {
                             }
                             Err(_) => {
                                 // Not complete yet, continue accumulating
+                                // The timeout on read_line will handle incomplete JSON timeouts
                                 continue;
                             }
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         let _ = tx.send(Err(ClaudeError::Io(e)));
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = tx.send(Err(ClaudeError::timeout("Read operation timed out")));
                         break;
                     }
                 }
@@ -566,33 +609,37 @@ impl Transport for SubprocessTransport {
             let _ = stdin.shutdown().await;
         }
 
-        // Try to wait for the process to exit gracefully first
-        if let Some(mut child) = self.process.take() {
-            // Give the process a moment to exit gracefully
-            let timeout = tokio::time::sleep(std::time::Duration::from_millis(500));
-            tokio::pin!(timeout);
-
-            tokio::select! {
-                _ = child.wait() => {
-                    // Process exited gracefully
-                }
-                _ = &mut timeout => {
-                    // Timeout - kill the process
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                }
-            }
-        }
-
-        // Abort reader and stderr tasks after process is done
+        // Abort reader and stderr tasks first to prevent race conditions
         if let Some(task) = self.reader_task.take() {
             task.abort();
+            // Give the task a moment to clean up
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         if let Some(task) = self.stderr_task.take() {
             task.abort();
         }
 
         self.stdout = None;
+
+        // Try to wait for the process to exit gracefully first
+        if let Some(mut child) = self.process.take() {
+            // Give the process a configurable timeout to exit gracefully
+            let timeout_duration = std::time::Duration::from_secs(5);
+
+            match tokio::time::timeout(timeout_duration, child.wait()).await {
+                Ok(Ok(_status)) => {
+                    // Process exited gracefully
+                }
+                Ok(Err(e)) => {
+                    return Err(ClaudeError::Io(e));
+                }
+                Err(_) => {
+                    // Timeout - kill the process
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
+            }
+        }
 
         Ok(())
     }

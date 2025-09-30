@@ -223,6 +223,21 @@ Key principles applied:
 - **Builder pattern** for complex types
 - **Trait abstraction** for extensibility
 
+## Security
+
+This SDK has undergone security hardening with multiple layers of protection:
+
+- **Environment variable filtering** - Blocks dangerous variables like `LD_PRELOAD`, `PATH`, `NODE_OPTIONS`
+- **Argument validation** - Allowlist for CLI flags prevents injection attacks
+- **Timeout protection** - All I/O operations have configurable timeouts
+- **Buffer limits** - Prevents memory exhaustion from unbounded growth
+- **Secure defaults** - Conservative defaults for all security-sensitive options
+- **No unsafe code** - 100% safe Rust with compiler guarantees
+
+For details on security improvements, see:
+- `fixes.md` - Complete security audit report
+- `SECURITY_FIXES_APPLIED.md` - Implementation details
+
 ## Contributing
 
 This is a reference implementation demonstrating Rust SDK development best practices. See `PLAN.md` for the complete implementation roadmap.

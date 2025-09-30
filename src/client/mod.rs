@@ -141,20 +141,17 @@
 //! # }
 //! ```
 
-use futures::{Stream, StreamExt};
-use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::control::{ControlMessage, ControlRequest, ControlResponse, ProtocolHandler};
+use crate::control::{ControlMessage, ControlRequest, ProtocolHandler};
 use crate::error::{ClaudeError, Result};
 use crate::hooks::HookManager;
 use crate::message::parse_message;
 use crate::permissions::PermissionManager;
 use crate::transport::{PromptInput, SubprocessTransport, Transport};
 use crate::types::{
-    ClaudeAgentOptions, HookContext, HookEvent, HookOutput, Message, PermissionRequest,
-    PermissionResult, RequestId, ToolName, ToolPermissionContext,
+    ClaudeAgentOptions, HookContext, HookEvent, Message, PermissionRequest, RequestId,
 };
 
 /// Client for bidirectional communication with Claude Code
@@ -195,9 +192,11 @@ pub struct ClaudeSDKClient {
     hook_rx: Option<mpsc::UnboundedReceiver<(String, HookEvent)>>,
     /// Permission request receiver (if not using automatic handler)
     permission_rx: Option<mpsc::UnboundedReceiver<(RequestId, PermissionRequest)>>,
-    /// Hook manager for automatic hook handling
+    /// Hook manager for automatic hook handling (kept alive for background tasks)
+    #[allow(dead_code)]
     hook_manager: Option<Arc<Mutex<HookManager>>>,
-    /// Permission manager for automatic permission handling
+    /// Permission manager for automatic permission handling (kept alive for background tasks)
+    #[allow(dead_code)]
     permission_manager: Option<Arc<Mutex<PermissionManager>>>,
 }
 
@@ -433,7 +432,7 @@ impl ClaudeSDKClient {
         protocol: Arc<Mutex<ProtocolHandler>>,
         mut hook_rx: mpsc::UnboundedReceiver<(String, HookEvent)>,
     ) {
-        while let Some((hook_id, event)) = hook_rx.recv().await {
+        while let Some((hook_id, _event)) = hook_rx.recv().await {
             // TODO: Extract event data from the hook event
             // For now, invoke with empty data
             let manager_guard = manager.lock().await;
@@ -456,10 +455,16 @@ impl ClaudeSDKClient {
                     // For now, hooks are processed but response sending needs client cooperation
                     // This is acceptable as hooks are advisory
                     // In a full implementation, we'd send _request through control_tx
-                    println!("Hook processed for event {event:?}");
+                    #[cfg(feature = "tracing-support")]
+                    tracing::debug!(event = ?_event, "Hook processed");
+                    #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                    eprintln!("Hook processed for event {_event:?}");
                 }
-                Err(e) => {
-                    eprintln!("Hook processing error: {e}");
+                Err(_e) => {
+                    #[cfg(feature = "tracing-support")]
+                    tracing::error!(error = %_e, "Hook processing error");
+                    #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                    eprintln!("Hook processing error: {_e}");
                 }
             }
         }
@@ -494,10 +499,16 @@ impl ClaudeSDKClient {
                     // For now, permissions are processed but response sending needs client cooperation
                     // This is acceptable for the automatic mode
                     // In a full implementation, we'd send _request through control_tx
-                    println!("Permission {} processed: {:?}", request_id.as_str(), result);
+                    #[cfg(feature = "tracing-support")]
+                    tracing::debug!(request_id = %request_id.as_str(), result = ?result, "Permission processed");
+                    #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                    eprintln!("Permission {} processed: {:?}", request_id.as_str(), result);
                 }
-                Err(e) => {
-                    eprintln!("Permission processing error: {e}");
+                Err(_e) => {
+                    #[cfg(feature = "tracing-support")]
+                    tracing::error!(error = %_e, "Permission processing error");
+                    #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                    eprintln!("Permission processing error: {_e}");
                 }
             }
         }

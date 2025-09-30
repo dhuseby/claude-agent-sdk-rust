@@ -796,6 +796,12 @@ impl ClaudeAgentOptionsBuilder {
 
     /// Set max turns
     pub fn max_turns(mut self, turns: u32) -> Self {
+        const MAX_ALLOWED_TURNS: u32 = 1000;
+        if turns > MAX_ALLOWED_TURNS {
+            panic!(
+                "max_turns {turns} exceeds maximum allowed: {MAX_ALLOWED_TURNS}"
+            );
+        }
         self.options.max_turns = Some(turns);
         self
     }

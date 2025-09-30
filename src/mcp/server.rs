@@ -230,6 +230,17 @@ impl SdkMcpServer {
 
         let arguments = params["arguments"].clone();
 
+        // TODO: Add JSON schema validation here
+        // For production use, validate arguments against tool.input_schema
+        // using a crate like jsonschema or valico:
+        //
+        // if let Err(errors) = validate_schema(&arguments, &tool.input_schema) {
+        //     return Ok(JsonRpcResponse::error(
+        //         request_id,
+        //         McpError::invalid_params(format!("Schema validation failed: {:?}", errors)),
+        //     ));
+        // }
+
         // Invoke the tool
         match tool.invoke(arguments).await {
             Ok(result) => {
@@ -259,7 +270,7 @@ impl std::fmt::Debug for SdkMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::{ToolContent, ToolResult};
+    use crate::mcp::ToolResult;
     use serde_json::json;
 
     fn create_test_tool(name: &str) -> SdkMcpTool {

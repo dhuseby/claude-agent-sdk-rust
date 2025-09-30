@@ -1,7 +1,6 @@
 //! Simple query function for one-shot interactions
 
-use futures::{Stream, StreamExt};
-use std::pin::Pin;
+use futures::Stream;
 
 use crate::error::Result;
 use crate::message::parse_message;
@@ -126,6 +125,7 @@ pub async fn query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
 
     #[tokio::test]
     async fn test_simple_query() {

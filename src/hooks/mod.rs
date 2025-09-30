@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::error::Result;
-use crate::types::{HookCallback, HookContext, HookDecision, HookEvent, HookMatcher, HookOutput};
+use crate::types::{HookCallback, HookContext, HookDecision, HookMatcher, HookOutput};
 
 /// Hook manager for registering and invoking hooks
 pub struct HookManager {
@@ -77,6 +77,11 @@ impl HookManager {
     }
 
     /// Check if a matcher matches a tool name
+    ///
+    /// # Security Note
+    /// This uses simple pattern matching with pipe-separated alternatives.
+    /// For production use with untrusted patterns, consider using a proper
+    /// glob or regex library with safety guarantees (e.g., `globset` crate).
     fn matches(matcher: &Option<String>, tool_name: &Option<String>) -> bool {
         match (matcher, tool_name) {
             (None, _) => true, // No matcher = match all
@@ -85,7 +90,8 @@ impl HookManager {
                 if pattern == "*" {
                     return true;
                 }
-                // Exact match or regex-like pattern
+                // Exact match or simple pipe-separated pattern
+                // Note: This doesn't handle edge cases like pipe characters in tool names
                 pattern == name || pattern.split('|').any(|p| p == name)
             }
             (Some(_), None) => false,

@@ -235,6 +235,19 @@
 //! - **Resource management** - Proper cleanup via RAII and Drop
 //! - **Error handling** - Comprehensive error types with context
 //!
+//! ## Security
+//!
+//! This SDK includes multiple layers of security protection:
+//!
+//! - **Environment variable filtering** - Dangerous variables like `LD_PRELOAD`, `PATH`, `NODE_OPTIONS` are blocked
+//! - **Argument validation** - CLI flags are validated against an allowlist
+//! - **Timeout protection** - All I/O operations have 30-second timeouts
+//! - **Buffer limits** - Configurable max buffer size (default 1MB) prevents memory exhaustion
+//! - **Bounds checking** - Limits on configurable values (e.g., max_turns ≤ 1000)
+//! - **Secure logging** - Sensitive data only logged in debug builds with proper feature flags
+//!
+//! For complete security details, see `SECURITY_FIXES_APPLIED.md` in the repository.
+//!
 //! ## Version History
 //!
 //! - **0.1.0** (Current) - Initial release with full feature parity
@@ -248,8 +261,6 @@
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
-#![allow(dead_code)] // Allow during development
-#![allow(unused_imports)] // Allow during development
 
 pub mod client;
 pub mod control;
