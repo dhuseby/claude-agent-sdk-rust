@@ -1,0 +1,72 @@
+[package]
+name = "claude-agent-sdk"
+version = "0.1.0"
+edition = "2021"
+authors = ["Anthropic <support@anthropic.com>"]
+description = "Rust SDK for Claude Agent"
+license = "MIT"
+repository = "https://github.com/anthropics/claude-agent-sdk-rust"
+keywords = ["claude", "ai", "sdk", "anthropic", "agent"]
+categories = ["api-bindings", "asynchronous"]
+rust-version = "1.75.0"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client (for future MCP HTTP support)
+reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
+
+# Error handling
+thiserror = "1.0"
+
+# Async streams
+futures = "0.3"
+async-stream = "0.3"
+async-trait = "0.1"
+
+# Process utilities
+which = "6.0"
+
+# Optional: Tracing
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+
+[dev-dependencies]
+anyhow = "1.0"
+tokio-test = "0.4"
+tempfile = "3.0"
+
+[features]
+default = []
+http = ["reqwest"]
+tracing-support = ["tracing", "tracing-subscriber"]
+
+[[example]]
+name = "simple_query"
+path = "examples/simple_query.rs"
+
+[[example]]
+name = "interactive_client"
+path = "examples/interactive_client.rs"
+
+[[example]]
+name = "bidirectional_demo"
+path = "examples/bidirectional_demo.rs"
+
+[[example]]
+name = "hooks_demo"
+path = "examples/hooks_demo.rs"
+
+[[example]]
+name = "permissions_demo"
+path = "examples/permissions_demo.rs"
+
+[[example]]
+name = "mcp_demo"
+path = "examples/mcp_demo.rs"
