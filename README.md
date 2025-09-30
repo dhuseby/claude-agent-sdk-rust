@@ -4,7 +4,7 @@ Rust SDK for Claude Agent. A Rust implementation mirroring the [Python Claude Ag
 
 ## Status
 
-✅ **Production Ready** - v0.1.0 - Full feature parity with Python SDK
+✅ **Feature Parity** - v0.1.0 - Full feature parity with Python SDK
 
 ### Completed Features
 - ✅ Core error types with `thiserror`
