@@ -3,15 +3,21 @@
 //! This module provides the hook system that allows users to intercept
 //! and respond to various events in the agent lifecycle.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::error::Result;
+use crate::error::{ClaudeError, Result};
 use crate::types::{HookCallback, HookContext, HookDecision, HookMatcher, HookOutput};
 
 /// Hook manager for registering and invoking hooks
 pub struct HookManager {
     /// Registered hook matchers
     matchers: Vec<HookMatcher>,
+    /// Map callback_id -> (matcher_index, callback_index)
+    /// Used to look up callbacks when CLI sends hook_callback requests
+    callback_id_map: HashMap<String, (usize, usize)>,
+    /// Counter for generating unique callback IDs
+    next_callback_id: u32,
 }
 
 impl HookManager {
@@ -19,6 +25,8 @@ impl HookManager {
     pub fn new() -> Self {
         Self {
             matchers: Vec::new(),
+            callback_id_map: HashMap::new(),
+            next_callback_id: 0,
         }
     }
 
@@ -28,6 +36,61 @@ impl HookManager {
     /// * `matcher` - Hook matcher configuration
     pub fn register(&mut self, matcher: HookMatcher) {
         self.matchers.push(matcher);
+    }
+
+    /// Register a matcher and generate callback IDs for all its hooks
+    ///
+    /// # Arguments
+    /// * `matcher` - Hook matcher configuration
+    ///
+    /// # Returns
+    /// Vector of generated callback IDs for the hooks in this matcher
+    pub fn register_with_ids(&mut self, matcher: HookMatcher) -> Vec<String> {
+        let matcher_index = self.matchers.len();
+        let mut callback_ids = Vec::new();
+
+        // Generate callback IDs for each hook in this matcher
+        for callback_index in 0..matcher.hooks.len() {
+            let callback_id = format!("hook_{}", self.next_callback_id);
+            self.next_callback_id += 1;
+
+            self.callback_id_map.insert(
+                callback_id.clone(),
+                (matcher_index, callback_index)
+            );
+            callback_ids.push(callback_id);
+        }
+
+        self.matchers.push(matcher);
+        callback_ids
+    }
+
+    /// Invoke a callback by its callback_id (used when CLI sends hook_callback request)
+    ///
+    /// # Arguments
+    /// * `callback_id` - The callback ID to invoke
+    /// * `event_data` - Event data (JSON value)
+    /// * `tool_name` - Optional tool name
+    /// * `context` - Hook context
+    ///
+    /// # Returns
+    /// Hook output from the specific callback
+    pub async fn invoke_by_id(
+        &self,
+        callback_id: &str,
+        event_data: serde_json::Value,
+        tool_name: Option<String>,
+        context: HookContext,
+    ) -> Result<HookOutput> {
+        let (matcher_index, callback_index) = self
+            .callback_id_map
+            .get(callback_id)
+            .ok_or_else(|| ClaudeError::hook(format!("Unknown callback_id: {}", callback_id)))?;
+
+        let matcher = &self.matchers[*matcher_index];
+        let callback = &matcher.hooks[*callback_index];
+
+        callback(event_data, tool_name, context).await
     }
 
     /// Invoke hooks for a given event

@@ -144,12 +144,21 @@ impl SubprocessTransport {
     fn build_command(&self) -> Command {
         let mut cmd = Command::new(&self.cli_path);
 
-        // Always use --print for non-interactive mode to avoid terminal manipulation
-        cmd.arg("--print");
+        // Use streaming mode when hooks/permissions are configured
+        let needs_control_protocol = self.options.hooks.is_some()
+            || self.options.can_use_tool.is_some();
 
-        cmd.arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose");
+        if needs_control_protocol {
+            // Streaming mode: required for bidirectional control protocol
+            cmd.arg("--input-format").arg("stream-json");
+            cmd.arg("--output-format").arg("stream-json");
+        } else {
+            // Non-interactive print mode: simpler for no-hook scenarios
+            cmd.arg("--print");
+            cmd.arg("--output-format").arg("stream-json");
+        }
+
+        cmd.arg("--verbose");
 
         // System prompt
         if let Some(ref system_prompt) = self.options.system_prompt {
@@ -298,12 +307,15 @@ impl SubprocessTransport {
         // Prompt handling based on mode
         match &self.prompt {
             PromptInput::Stream => {
-                // Streaming mode: use --input-format stream-json
-                cmd.arg("--input-format").arg("stream-json");
+                // Already handled by needs_control_protocol check above
+                // No additional args needed
             }
             PromptInput::String(s) => {
-                // String mode: pass the prompt as an argument after --
-                cmd.arg("--").arg(s);
+                if !needs_control_protocol {
+                    // String mode: pass the prompt as an argument after --
+                    cmd.arg("--").arg(s);
+                }
+                // In control protocol mode, prompt will be sent via stdin
             }
         }
 
@@ -514,8 +526,9 @@ impl Transport for SubprocessTransport {
                 let mut line = String::new();
 
                 // Add timeout to read_line to prevent hanging
+                // Increased to 5 minutes for complex suborchestrator operations
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(300),
                     stdout.read_line(&mut line)
                 ).await {
                     Ok(Ok(0)) => break, // EOF

@@ -123,8 +123,8 @@
 //!
 //! // Handle hook events
 //! tokio::spawn(async move {
-//!     while let Some((hook_id, event)) = hook_rx.recv().await {
-//!         println!("Hook: {} {:?}", hook_id, event);
+//!     while let Some((hook_id, event, data)) = hook_rx.recv().await {
+//!         println!("Hook: {} {:?} data: {}", hook_id, event, data);
 //!         // Respond to hook...
 //!     }
 //! });
@@ -141,10 +141,12 @@
 //! # }
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::control::{ControlMessage, ControlRequest, ProtocolHandler};
+use crate::control::protocol::HookMatcherConfig;
 use crate::error::{ClaudeError, Result};
 use crate::hooks::HookManager;
 use crate::message::parse_message;
@@ -189,7 +191,7 @@ pub struct ClaudeSDKClient {
     /// Control message sender
     control_tx: mpsc::UnboundedSender<ControlRequest>,
     /// Hook event receiver (if not using automatic handler)
-    hook_rx: Option<mpsc::UnboundedReceiver<(String, HookEvent)>>,
+    hook_rx: Option<mpsc::UnboundedReceiver<(String, HookEvent, serde_json::Value)>>,
     /// Permission request receiver (if not using automatic handler)
     permission_rx: Option<mpsc::UnboundedReceiver<(RequestId, PermissionRequest)>>,
     /// Hook manager for automatic hook handling (kept alive for background tasks)
@@ -214,16 +216,30 @@ impl ClaudeSDKClient {
         cli_path: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         // Initialize hook manager if hooks are configured
-        let (hook_manager, hook_rx) = if let Some(ref hooks_config) = options.hooks {
+        let (hook_manager, _hooks_for_init) = if let Some(ref hooks_config) = options.hooks {
             let mut manager = HookManager::new();
-            for matchers in hooks_config.values() {
+            let mut hooks_init_config = HashMap::new();
+
+            // Register each hook matcher and collect callback IDs
+            for (event, matchers) in hooks_config {
+                let mut matcher_configs = Vec::new();
+
                 for matcher in matchers {
-                    manager.register(matcher.clone());
+                    // Register and get generated callback IDs
+                    let callback_ids = manager.register_with_ids(matcher.clone());
+
+                    matcher_configs.push(HookMatcherConfig {
+                        matcher: matcher.matcher.clone(),
+                        hook_callback_ids: callback_ids,
+                    });
                 }
+
+                hooks_init_config.insert(*event, matcher_configs);
             }
-            (Some(Arc::new(Mutex::new(manager))), None)
+
+            (Some(Arc::new(Mutex::new(manager))), Some(hooks_init_config))
         } else {
-            (None, Some(mpsc::unbounded_channel().1))
+            (None, None)
         };
 
         // Initialize permission manager if callback is configured
@@ -250,17 +266,19 @@ impl ClaudeSDKClient {
         let mut protocol = ProtocolHandler::new();
 
         // Set up channels
-        let (hook_tx, hook_rx_internal) = mpsc::unbounded_channel();
+        let (hook_tx, hook_rx_internal) = mpsc::unbounded_channel::<(String, HookEvent, serde_json::Value)>();
         let (permission_tx, permission_rx_internal) = mpsc::unbounded_channel();
+        let (hook_callback_tx, hook_callback_rx) = mpsc::unbounded_channel::<(RequestId, String, serde_json::Value, Option<String>)>();
+
         protocol.set_hook_channel(hook_tx);
         protocol.set_permission_channel(permission_tx);
+        protocol.set_hook_callback_channel(hook_callback_tx);
 
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
 
-        // Note: Claude CLI doesn't use a separate control protocol initialization.
-        // The stream-json mode expects user messages to be sent directly.
-        // Mark protocol as initialized immediately.
+        // Note: For hooks to work, we need to send initialization with hooks config
+        // Mark protocol as initialized immediately for now (will send init below if needed)
         protocol.set_initialized(true);
 
         let transport = Arc::new(Mutex::new(transport));
@@ -290,6 +308,22 @@ impl ClaudeSDKClient {
             });
         }
 
+        // Spawn hook callback handler task if hook manager is configured
+        if let Some(ref manager) = hook_manager {
+            let manager_clone = manager.clone();
+            let protocol_clone = protocol.clone();
+            let control_tx_clone = control_tx.clone();
+            tokio::spawn(async move {
+                Self::hook_callback_handler_task(
+                    manager_clone,
+                    protocol_clone,
+                    control_tx_clone,
+                    hook_callback_rx,
+                )
+                .await;
+            });
+        }
+
         // Spawn permission handler task if permission manager is configured
         if let Some(ref manager) = permission_manager {
             let manager_clone = manager.clone();
@@ -304,16 +338,24 @@ impl ClaudeSDKClient {
             });
         }
 
-        Ok(Self {
+        let mut client = Self {
             transport,
             protocol,
             message_rx,
             control_tx,
-            hook_rx,
+            hook_rx: None,  // Hooks are handled automatically by hook_callback_handler_task
             permission_rx,
             hook_manager,
             permission_manager,
-        })
+        };
+
+        // Send initialization request if hooks are configured
+        // This must happen AFTER spawning tasks so the message reader can process the response
+        if let Some(hooks_config) = _hooks_for_init {
+            client.send_initialize(hooks_config).await?;
+        }
+
+        Ok(client)
     }
 
     /// Message reader task - reads from transport and processes messages
@@ -331,7 +373,58 @@ impl ClaudeSDKClient {
         while let Some(result) = msg_stream.recv().await {
             match result {
                 Ok(value) => {
-                    // Try to parse as control message first
+                    // Check message type field
+                    let msg_type = value.get("type").and_then(|v| v.as_str());
+
+                    // Handle control_response (init response, etc.)
+                    if msg_type == Some("control_response") {
+                        // This is a response to our init request - just log and continue
+                        #[cfg(feature = "tracing-support")]
+                        tracing::debug!("Received control_response");
+                        #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                        eprintln!("Received control_response");
+                        continue;
+                    }
+
+                    // Handle control_request (hook callbacks from CLI)
+                    if msg_type == Some("control_request") {
+                        let protocol_guard = protocol.lock().await;
+
+                        // Extract request data
+                        if let Some(request_obj) = value.get("request").and_then(|v| v.as_object()) {
+                            let subtype = request_obj.get("subtype").and_then(|v| v.as_str());
+
+                            if subtype == Some("hook_callback") {
+                                // Extract hook callback data
+                                let request_id = value.get("request_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| RequestId::new(s))
+                                    .unwrap_or_else(|| RequestId::new("unknown"));
+
+                                let callback_id = request_obj.get("callback_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("").to_string();
+
+                                let input = request_obj.get("input")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({}));
+
+                                let tool_use_id = request_obj.get("tool_use_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
+
+                                // Send to hook callback channel
+                                if let Some(tx) = protocol_guard.get_hook_callback_channel() {
+                                    let _ = tx.send((request_id, callback_id, input, tool_use_id));
+                                }
+                            }
+                        }
+
+                        drop(protocol_guard);
+                        continue;
+                    }
+
+                    // Try to parse as ControlMessage types (init, init_response)
                     let protocol_guard = protocol.lock().await;
                     if let Ok(control_msg) = protocol_guard.deserialize_message(
                         &serde_json::to_string(&value).unwrap_or_default(),
@@ -408,6 +501,17 @@ impl ClaudeSDKClient {
                         }
                     })
                 }
+                ControlRequest::HookCallbackResponse { id, output } => {
+                    // Send hook callback response back to CLI in Python SDK format
+                    serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": id.as_str(),
+                            "response": output
+                        }
+                    })
+                }
                 _ => {
                     // Other control types not yet supported in stream-json mode
                     continue;
@@ -430,16 +534,20 @@ impl ClaudeSDKClient {
     async fn hook_handler_task(
         manager: Arc<Mutex<HookManager>>,
         protocol: Arc<Mutex<ProtocolHandler>>,
-        mut hook_rx: mpsc::UnboundedReceiver<(String, HookEvent)>,
+        mut hook_rx: mpsc::UnboundedReceiver<(String, HookEvent, serde_json::Value)>,
     ) {
-        while let Some((hook_id, _event)) = hook_rx.recv().await {
-            // TODO: Extract event data from the hook event
-            // For now, invoke with empty data
+        while let Some((hook_id, _event, data)) = hook_rx.recv().await {
             let manager_guard = manager.lock().await;
             let context = HookContext {};
 
+            // Extract tool_name from data if present
+            let tool_name = data.get("tool_name")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            // Use actual event data instead of empty JSON
             match manager_guard
-                .invoke(serde_json::json!({}), None, context)
+                .invoke(data, tool_name, context)
                 .await
             {
                 Ok(output) => {
@@ -465,6 +573,67 @@ impl ClaudeSDKClient {
                     tracing::error!(error = %_e, "Hook processing error");
                     #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
                     eprintln!("Hook processing error: {_e}");
+                }
+            }
+        }
+    }
+
+    /// Hook callback handler task - handles incoming hook_callback requests from CLI
+    async fn hook_callback_handler_task(
+        manager: Arc<Mutex<HookManager>>,
+        protocol: Arc<Mutex<ProtocolHandler>>,
+        control_tx: mpsc::UnboundedSender<ControlRequest>,
+        mut hook_callback_rx: mpsc::UnboundedReceiver<(RequestId, String, serde_json::Value, Option<String>)>,
+    ) {
+        while let Some((request_id, callback_id, input, _tool_use_id)) = hook_callback_rx.recv().await {
+            #[cfg(feature = "tracing-support")]
+            tracing::debug!(
+                request_id = %request_id.as_str(),
+                callback_id = %callback_id,
+                "Processing hook callback request"
+            );
+
+            let manager_guard = manager.lock().await;
+            let context = HookContext {};
+
+            // Extract tool_name from input if present
+            let tool_name = input
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            // Invoke the hook by callback_id
+            match manager_guard.invoke_by_id(&callback_id, input, tool_name, context).await {
+                Ok(output) => {
+                    drop(manager_guard);
+
+                    // Create and send hook callback response
+                    let protocol_guard = protocol.lock().await;
+                    let output_json = serde_json::to_value(&output).unwrap_or_default();
+                    let response = protocol_guard.create_hook_callback_response(request_id, output_json);
+                    drop(protocol_guard);
+
+                    // Send response back to CLI
+                    if let Err(e) = control_tx.send(response) {
+                        #[cfg(feature = "tracing-support")]
+                        tracing::error!(error = ?e, "Failed to send hook callback response");
+                        #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                        eprintln!("Failed to send hook callback response: {e:?}");
+                    }
+
+                    #[cfg(feature = "tracing-support")]
+                    tracing::debug!(callback_id = %callback_id, "Hook callback processed");
+                    #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                    eprintln!("Hook callback processed for {callback_id}");
+                }
+                Err(e) => {
+                    #[cfg(feature = "tracing-support")]
+                    tracing::error!(error = %e, callback_id = %callback_id, "Hook callback error");
+                    #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                    eprintln!("Hook callback error for {callback_id}: {e}");
+
+                    // TODO: Send error response
+                    // For now, just log the error
                 }
             }
         }
@@ -512,6 +681,51 @@ impl ClaudeSDKClient {
                 }
             }
         }
+    }
+
+    /// Send initialization request with hooks configuration to CLI
+    ///
+    /// # Arguments
+    /// * `hooks_config` - Hooks configuration with callback IDs
+    ///
+    /// # Errors
+    /// Returns error if initialization fails
+    async fn send_initialize(
+        &mut self,
+        hooks_config: HashMap<HookEvent, Vec<HookMatcherConfig>>,
+    ) -> Result<()> {
+        // Generate unique request ID
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+        let counter = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let request_id = format!("req_{}_{:x}", counter, nanos);
+
+        // Build initialize request
+        let init_request = serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {
+                "subtype": "initialize",
+                "hooks": hooks_config
+            }
+        });
+
+        // Send initialization request
+        let message_json = format!("{}\n", serde_json::to_string(&init_request)?);
+        let mut transport = self.transport.lock().await;
+        transport.write(&message_json).await?;
+        drop(transport);
+
+        // Wait a bit for the CLI to process initialization
+        // TODO: Wait for actual init response instead of sleeping
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        Ok(())
     }
 
     /// Send a message to Claude
@@ -565,7 +779,7 @@ impl ClaudeSDKClient {
     /// Take the hook event receiver
     ///
     /// This allows the caller to handle hook events independently
-    pub fn take_hook_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<(String, HookEvent)>> {
+    pub fn take_hook_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<(String, HookEvent, serde_json::Value)>> {
         self.hook_rx.take()
     }
 
