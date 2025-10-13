@@ -159,6 +159,7 @@ impl SdkMcpServer {
     /// Handle an MCP JSONRPC request
     ///
     /// Processes JSONRPC requests according to the MCP protocol:
+    /// - `initialize` - Initializes the MCP server connection
     /// - `tools/list` - Returns list of available tools
     /// - `tools/call` - Invokes a specific tool
     ///
@@ -169,6 +170,8 @@ impl SdkMcpServer {
         let request_id = request.id.clone().unwrap_or(serde_json::json!(null));
 
         match request.method.as_str() {
+            "initialize" => self.handle_initialize(request_id).await,
+            "notifications/initialized" => self.handle_notifications_initialized(request_id).await,
             "tools/list" => self.handle_tools_list(request_id).await,
             "tools/call" => self.handle_tools_call(request_id, request.params).await,
             _ => Ok(JsonRpcResponse::error(
@@ -176,6 +179,30 @@ impl SdkMcpServer {
                 McpError::method_not_found(&request.method),
             )),
         }
+    }
+
+    /// Handle `initialize` request
+    async fn handle_initialize(&self, request_id: serde_json::Value) -> Result<JsonRpcResponse> {
+        Ok(JsonRpcResponse::success(
+            request_id,
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {
+                    "name": self.name,
+                    "version": self.version
+                },
+                "capabilities": {
+                    "tools": {}
+                }
+            }),
+        ))
+    }
+
+    /// Handle `notifications/initialized` notification
+    async fn handle_notifications_initialized(&self, request_id: serde_json::Value) -> Result<JsonRpcResponse> {
+        // This is a notification, so we just acknowledge it
+        // Notifications typically have no response in JSONRPC, but we'll return success
+        Ok(JsonRpcResponse::success(request_id, serde_json::json!({})))
     }
 
     /// Handle `tools/list` request

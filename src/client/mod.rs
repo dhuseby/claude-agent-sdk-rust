@@ -204,7 +204,8 @@ pub struct ClaudeSDKClient {
     /// SDK MCP servers (kept alive for background tasks)
     #[allow(dead_code)]
     sdk_mcp_servers: HashMap<String, Arc<crate::mcp::SdkMcpServer>>,
-    /// MCP callback channel sender
+    /// MCP callback channel sender (kept alive for background task)
+    #[allow(dead_code)]
     mcp_callback_tx: Option<mpsc::UnboundedSender<(RequestId, String, serde_json::Value)>>,
 }
 
@@ -398,13 +399,15 @@ impl ClaudeSDKClient {
             permission_rx,
             hook_manager,
             permission_manager,
-            sdk_mcp_servers,
+            sdk_mcp_servers: sdk_mcp_servers.clone(),
             mcp_callback_tx,
         };
 
-        // Send initialization request if hooks are configured
+        // Send initialization request if hooks are configured OR if SDK MCP servers are present
         // This must happen AFTER spawning tasks so the message reader can process the response
-        if let Some(hooks_config) = _hooks_for_init {
+        let has_sdk_mcp = !sdk_mcp_servers.is_empty();
+        if _hooks_for_init.is_some() || has_sdk_mcp {
+            let hooks_config = _hooks_for_init.unwrap_or_default();
             client.send_initialize(hooks_config).await?;
         }
 
@@ -699,11 +702,11 @@ impl ClaudeSDKClient {
                     drop(protocol_guard);
 
                     // Send response back to CLI
-                    if let Err(e) = control_tx.send(response) {
+                    if let Err(_e) = control_tx.send(response) {
                         #[cfg(feature = "tracing-support")]
-                        tracing::error!(error = ?e, "Failed to send hook callback response");
+                        tracing::error!(error = ?_e, "Failed to send hook callback response");
                         #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
-                        eprintln!("Failed to send hook callback response: {e:?}");
+                        eprintln!("Failed to send hook callback response: {_e:?}");
                     }
 
                     #[cfg(feature = "tracing-support")]
@@ -711,11 +714,11 @@ impl ClaudeSDKClient {
                     #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
                     eprintln!("Hook callback processed for {callback_id}");
                 }
-                Err(e) => {
+                Err(_e) => {
                     #[cfg(feature = "tracing-support")]
-                    tracing::error!(error = %e, callback_id = %callback_id, "Hook callback error");
+                    tracing::error!(error = %_e, callback_id = %callback_id, "Hook callback error");
                     #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
-                    eprintln!("Hook callback error for {callback_id}: {e}");
+                    eprintln!("Hook callback error for {callback_id}: {_e}");
 
                     // TODO: Send error response
                     // For now, just log the error
@@ -770,21 +773,30 @@ impl ClaudeSDKClient {
             // Parse JSONRPC request
             let jsonrpc_request: crate::mcp::protocol::JsonRpcRequest = match serde_json::from_value(message) {
                 Ok(req) => req,
-                Err(e) => {
+                Err(_e) => {
                     #[cfg(feature = "tracing-support")]
-                    tracing::error!(error = %e, "Failed to parse JSONRPC request");
+                    tracing::error!(error = %_e, "Failed to parse JSONRPC request");
                     #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
-                    eprintln!("Failed to parse JSONRPC request: {e}");
+                    eprintln!("Failed to parse JSONRPC request: {_e}");
                     continue;
                 }
             };
 
+            #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+            eprintln!("MCP method called: {} for server: {}", jsonrpc_request.method, server_name);
+
             // Invoke SDK MCP server handler
-            match server.handle_request(jsonrpc_request).await {
+            match server.handle_request(jsonrpc_request.clone()).await {
                 Ok(jsonrpc_response) => {
                     // Convert response to JSON
                     let response_json = serde_json::to_value(&jsonrpc_response)
                         .unwrap_or_else(|_| serde_json::json!({"error": "Serialization failed"}));
+
+                    #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                    {
+                        eprintln!("MCP response for {}: {}", jsonrpc_request.method,
+                            serde_json::to_string_pretty(&response_json).unwrap_or_default());
+                    }
 
                     // Create and send MCP message response
                     let protocol_guard = protocol.lock().await;
@@ -792,11 +804,11 @@ impl ClaudeSDKClient {
                     drop(protocol_guard);
 
                     // Send response back to CLI
-                    if let Err(e) = control_tx.send(response) {
+                    if let Err(_e) = control_tx.send(response) {
                         #[cfg(feature = "tracing-support")]
-                        tracing::error!(error = ?e, "Failed to send MCP response");
+                        tracing::error!(error = ?_e, "Failed to send MCP response");
                         #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
-                        eprintln!("Failed to send MCP response: {e:?}");
+                        eprintln!("Failed to send MCP response: {_e:?}");
                     }
 
                     #[cfg(feature = "tracing-support")]
