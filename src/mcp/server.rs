@@ -230,18 +230,15 @@ impl SdkMcpServer {
 
         let arguments = params["arguments"].clone();
 
-        // TODO: Add JSON schema validation here
-        // For production use, validate arguments against tool.input_schema
-        // using a crate like jsonschema or valico:
-        //
-        // if let Err(errors) = validate_schema(&arguments, &tool.input_schema) {
-        //     return Ok(JsonRpcResponse::error(
-        //         request_id,
-        //         McpError::invalid_params(format!("Schema validation failed: {:?}", errors)),
-        //     ));
-        // }
+        // Validate arguments against pre-compiled JSON schema
+        if let Err(e) = tool.validate_input(&arguments) {
+            return Ok(JsonRpcResponse::error(
+                request_id,
+                McpError::invalid_params(format!("Validation failed: {e}")),
+            ));
+        }
 
-        // Invoke the tool
+        // Invoke the tool (validation passed)
         match tool.invoke(arguments).await {
             Ok(result) => {
                 let result_json = serde_json::to_value(result)

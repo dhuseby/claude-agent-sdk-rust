@@ -424,6 +424,8 @@ pub struct SdkMcpServerMarker {
     /// Server name
     #[allow(dead_code)]
     pub name: String,
+    /// Server instance (stored for in-process execution)
+    pub instance: std::sync::Arc<crate::mcp::SdkMcpServer>,
 }
 
 /// MCP server configuration enum

@@ -53,6 +53,10 @@ pub enum ClaudeError {
     #[error("MCP error: {0}")]
     Mcp(String),
 
+    /// JSON Schema validation error
+    #[error("Schema validation error: {0}")]
+    ValidationError(String),
+
     /// I/O error
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

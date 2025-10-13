@@ -151,6 +151,14 @@ pub enum ControlRequest {
         /// Hook output data
         output: serde_json::Value,
     },
+    /// Response to MCP message request from CLI
+    #[serde(rename = "mcp_message_response")]
+    McpMessageResponse {
+        /// Request ID from the CLI's mcp_message request
+        id: RequestId,
+        /// JSONRPC response from SDK MCP server
+        mcp_response: serde_json::Value,
+    },
 }
 
 /// Response from CLI to SDK
@@ -206,6 +214,16 @@ pub enum ControlResponse {
         /// Tool use ID
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_use_id: Option<String>,
+    },
+    /// MCP message request from CLI to SDK
+    #[serde(rename = "mcp_message")]
+    McpMessage {
+        /// Request ID for this MCP message
+        id: RequestId,
+        /// Server name to route message to
+        server_name: String,
+        /// JSONRPC message to send to SDK MCP server
+        message: serde_json::Value,
     },
 }
 
@@ -291,6 +309,8 @@ pub struct ProtocolHandler {
     permission_tx: Option<mpsc::UnboundedSender<(RequestId, PermissionRequest)>>,
     /// Hook callback request channel (for incoming hook_callback requests from CLI)
     hook_callback_tx: Option<mpsc::UnboundedSender<(RequestId, String, serde_json::Value, Option<String>)>>,
+    /// MCP message callback channel (for incoming mcp_message requests from CLI)
+    mcp_callback_tx: Option<mpsc::UnboundedSender<(RequestId, String, serde_json::Value)>>,
 }
 
 impl ProtocolHandler {
@@ -303,6 +323,7 @@ impl ProtocolHandler {
             hook_tx: None,
             permission_tx: None,
             hook_callback_tx: None,
+            mcp_callback_tx: None,
         }
     }
 
@@ -330,6 +351,19 @@ impl ProtocolHandler {
     /// Get hook callback channel (for sending hook callbacks)
     pub fn get_hook_callback_channel(&self) -> Option<&mpsc::UnboundedSender<(RequestId, String, serde_json::Value, Option<String>)>> {
         self.hook_callback_tx.as_ref()
+    }
+
+    /// Set MCP message callback channel (for incoming mcp_message requests from CLI)
+    pub fn set_mcp_callback_channel(
+        &mut self,
+        tx: mpsc::UnboundedSender<(RequestId, String, serde_json::Value)>,
+    ) {
+        self.mcp_callback_tx = Some(tx);
+    }
+
+    /// Get MCP message callback channel
+    pub fn get_mcp_callback_channel(&self) -> Option<&mpsc::UnboundedSender<(RequestId, String, serde_json::Value)>> {
+        self.mcp_callback_tx.as_ref()
     }
 
     /// Check if protocol is initialized
@@ -427,6 +461,7 @@ impl ProtocolHandler {
             ControlRequest::HookResponse { id, .. } => id.clone(),
             ControlRequest::PermissionResponse { id, .. } => id.clone(),
             ControlRequest::HookCallbackResponse { id, .. } => id.clone(),
+            ControlRequest::McpMessageResponse { id, .. } => id.clone(),
         }
     }
 
@@ -458,6 +493,13 @@ impl ProtocolHandler {
                 if let Some(ref tx) = self.hook_callback_tx {
                     tx.send((id.clone(), callback_id.clone(), input.clone(), tool_use_id.clone()))
                         .map_err(|_| ClaudeError::protocol_error("Hook callback channel closed"))?;
+                }
+                Ok(())
+            }
+            ControlResponse::McpMessage { id, server_name, message } => {
+                if let Some(ref tx) = self.mcp_callback_tx {
+                    tx.send((id.clone(), server_name.clone(), message.clone()))
+                        .map_err(|_| ClaudeError::protocol_error("MCP callback channel closed"))?;
                 }
                 Ok(())
             }
@@ -514,6 +556,18 @@ impl ProtocolHandler {
         ControlRequest::HookCallbackResponse {
             id: request_id,
             output,
+        }
+    }
+
+    /// Create MCP message response
+    pub fn create_mcp_message_response(
+        &self,
+        request_id: RequestId,
+        mcp_response: serde_json::Value,
+    ) -> ControlRequest {
+        ControlRequest::McpMessageResponse {
+            id: request_id,
+            mcp_response,
         }
     }
 

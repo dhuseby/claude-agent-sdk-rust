@@ -144,16 +144,29 @@ impl SubprocessTransport {
     fn build_command(&self) -> Command {
         let mut cmd = Command::new(&self.cli_path);
 
-        // Use streaming mode when hooks/permissions are configured
-        let needs_control_protocol = self.options.hooks.is_some()
-            || self.options.can_use_tool.is_some();
+        // Use streaming mode when:
+        // 1. Prompt is Stream (interactive client using send_message)
+        // 2. Control protocol features are enabled (hooks/permissions/SDK MCP)
+        let has_sdk_mcp_servers = match &self.options.mcp_servers {
+            crate::types::McpServers::Dict(servers) => {
+                servers.values().any(|config| matches!(config, crate::types::McpServerConfig::Sdk(_)))
+            }
+            _ => false,
+        };
 
-        if needs_control_protocol {
-            // Streaming mode: required for bidirectional control protocol
+        let needs_control_protocol = self.options.hooks.is_some()
+            || self.options.can_use_tool.is_some()
+            || has_sdk_mcp_servers;
+
+        // Stream input ALWAYS needs streaming mode (used by ClaudeSDKClient.send_message)
+        let needs_streaming_mode = matches!(self.prompt, PromptInput::Stream) || needs_control_protocol;
+
+        if needs_streaming_mode {
+            // Streaming mode: required for interactive input and bidirectional control protocol
             cmd.arg("--input-format").arg("stream-json");
             cmd.arg("--output-format").arg("stream-json");
         } else {
-            // Non-interactive print mode: simpler for no-hook scenarios
+            // Non-interactive print mode: simpler for one-shot queries
             cmd.arg("--print");
             cmd.arg("--output-format").arg("stream-json");
         }
@@ -307,15 +320,15 @@ impl SubprocessTransport {
         // Prompt handling based on mode
         match &self.prompt {
             PromptInput::Stream => {
-                // Already handled by needs_control_protocol check above
-                // No additional args needed
+                // Stream mode is handled by streaming mode flags above
+                // No additional args needed - messages sent via stdin
             }
             PromptInput::String(s) => {
-                if !needs_control_protocol {
-                    // String mode: pass the prompt as an argument after --
+                if !needs_streaming_mode {
+                    // Print mode: pass the prompt as an argument after --
                     cmd.arg("--").arg(s);
                 }
-                // In control protocol mode, prompt will be sent via stdin
+                // In streaming mode, prompt will be sent via stdin
             }
         }
 

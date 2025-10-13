@@ -153,7 +153,8 @@ use crate::message::parse_message;
 use crate::permissions::PermissionManager;
 use crate::transport::{PromptInput, SubprocessTransport, Transport};
 use crate::types::{
-    ClaudeAgentOptions, HookContext, HookEvent, Message, PermissionRequest, RequestId,
+    ClaudeAgentOptions, HookContext, HookEvent, McpServerConfig, McpServers, Message,
+    PermissionRequest, RequestId,
 };
 
 /// Client for bidirectional communication with Claude Code
@@ -200,6 +201,11 @@ pub struct ClaudeSDKClient {
     /// Permission manager for automatic permission handling (kept alive for background tasks)
     #[allow(dead_code)]
     permission_manager: Option<Arc<Mutex<PermissionManager>>>,
+    /// SDK MCP servers (kept alive for background tasks)
+    #[allow(dead_code)]
+    sdk_mcp_servers: HashMap<String, Arc<crate::mcp::SdkMcpServer>>,
+    /// MCP callback channel sender
+    mcp_callback_tx: Option<mpsc::UnboundedSender<(RequestId, String, serde_json::Value)>>,
 }
 
 impl ClaudeSDKClient {
@@ -253,6 +259,22 @@ impl ClaudeSDKClient {
             (Some(Arc::new(Mutex::new(manager))), None)
         } else {
             (None, Some(mpsc::unbounded_channel().1))
+        };
+
+        // Extract SDK MCP servers from options
+        let sdk_mcp_servers = if let McpServers::Dict(ref servers) = options.mcp_servers {
+            servers
+                .iter()
+                .filter_map(|(name, config)| {
+                    if let McpServerConfig::Sdk(marker) = config {
+                        Some((name.clone(), marker.instance.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
         };
 
         // Create transport with streaming mode
@@ -338,6 +360,35 @@ impl ClaudeSDKClient {
             });
         }
 
+        // Spawn MCP message handler task if SDK servers are present
+        let mcp_callback_tx = if !sdk_mcp_servers.is_empty() {
+            let (mcp_tx, mcp_rx) = mpsc::unbounded_channel();
+
+            // Set channel in protocol handler
+            {
+                let mut protocol_guard = protocol.lock().await;
+                protocol_guard.set_mcp_callback_channel(mcp_tx.clone());
+            }
+
+            // Spawn handler task
+            let servers_clone = sdk_mcp_servers.clone();
+            let protocol_clone = protocol.clone();
+            let control_tx_clone = control_tx.clone();
+            tokio::spawn(async move {
+                Self::mcp_message_handler_task(
+                    servers_clone,
+                    protocol_clone,
+                    control_tx_clone,
+                    mcp_rx,
+                )
+                .await;
+            });
+
+            Some(mcp_tx)
+        } else {
+            None
+        };
+
         let mut client = Self {
             transport,
             protocol,
@@ -347,6 +398,8 @@ impl ClaudeSDKClient {
             permission_rx,
             hook_manager,
             permission_manager,
+            sdk_mcp_servers,
+            mcp_callback_tx,
         };
 
         // Send initialization request if hooks are configured
@@ -416,6 +469,25 @@ impl ClaudeSDKClient {
                                 // Send to hook callback channel
                                 if let Some(tx) = protocol_guard.get_hook_callback_channel() {
                                     let _ = tx.send((request_id, callback_id, input, tool_use_id));
+                                }
+                            } else if subtype == Some("mcp_message") {
+                                // Extract MCP message data
+                                let request_id = value.get("request_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| RequestId::new(s))
+                                    .unwrap_or_else(|| RequestId::new("unknown"));
+
+                                let server_name = request_obj.get("server_name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("").to_string();
+
+                                let message = request_obj.get("message")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({}));
+
+                                // Send to MCP callback channel
+                                if let Some(tx) = protocol_guard.get_mcp_callback_channel() {
+                                    let _ = tx.send((request_id, server_name, message));
                                 }
                             }
                         }
@@ -509,6 +581,19 @@ impl ClaudeSDKClient {
                             "subtype": "success",
                             "request_id": id.as_str(),
                             "response": output
+                        }
+                    })
+                }
+                ControlRequest::McpMessageResponse { id, mcp_response } => {
+                    // Send MCP message response back to CLI
+                    serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": id.as_str(),
+                            "response": {
+                                "mcp_response": mcp_response
+                            }
                         }
                     })
                 }
@@ -634,6 +719,111 @@ impl ClaudeSDKClient {
 
                     // TODO: Send error response
                     // For now, just log the error
+                }
+            }
+        }
+    }
+
+    /// MCP message handler task - handles incoming mcp_message requests from CLI
+    async fn mcp_message_handler_task(
+        sdk_mcp_servers: HashMap<String, Arc<crate::mcp::SdkMcpServer>>,
+        protocol: Arc<Mutex<ProtocolHandler>>,
+        control_tx: mpsc::UnboundedSender<ControlRequest>,
+        mut mcp_callback_rx: mpsc::UnboundedReceiver<(RequestId, String, serde_json::Value)>,
+    ) {
+        while let Some((request_id, server_name, message)) = mcp_callback_rx.recv().await {
+            #[cfg(feature = "tracing-support")]
+            tracing::debug!(
+                request_id = %request_id.as_str(),
+                server_name = %server_name,
+                "Processing MCP message request"
+            );
+
+            // Get SDK MCP server instance
+            let server = match sdk_mcp_servers.get(&server_name) {
+                Some(s) => s,
+                None => {
+                    #[cfg(feature = "tracing-support")]
+                    tracing::error!(server_name = %server_name, "SDK MCP server not found");
+                    #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                    eprintln!("SDK MCP server not found: {server_name}");
+
+                    // Send error response
+                    let error_response = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": message.get("id"),
+                        "error": {
+                            "code": -32601,
+                            "message": format!("Server '{server_name}' not found")
+                        }
+                    });
+
+                    let protocol_guard = protocol.lock().await;
+                    let response = protocol_guard.create_mcp_message_response(request_id, error_response);
+                    drop(protocol_guard);
+
+                    let _ = control_tx.send(response);
+                    continue;
+                }
+            };
+
+            // Parse JSONRPC request
+            let jsonrpc_request: crate::mcp::protocol::JsonRpcRequest = match serde_json::from_value(message) {
+                Ok(req) => req,
+                Err(e) => {
+                    #[cfg(feature = "tracing-support")]
+                    tracing::error!(error = %e, "Failed to parse JSONRPC request");
+                    #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                    eprintln!("Failed to parse JSONRPC request: {e}");
+                    continue;
+                }
+            };
+
+            // Invoke SDK MCP server handler
+            match server.handle_request(jsonrpc_request).await {
+                Ok(jsonrpc_response) => {
+                    // Convert response to JSON
+                    let response_json = serde_json::to_value(&jsonrpc_response)
+                        .unwrap_or_else(|_| serde_json::json!({"error": "Serialization failed"}));
+
+                    // Create and send MCP message response
+                    let protocol_guard = protocol.lock().await;
+                    let response = protocol_guard.create_mcp_message_response(request_id, response_json);
+                    drop(protocol_guard);
+
+                    // Send response back to CLI
+                    if let Err(e) = control_tx.send(response) {
+                        #[cfg(feature = "tracing-support")]
+                        tracing::error!(error = ?e, "Failed to send MCP response");
+                        #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                        eprintln!("Failed to send MCP response: {e:?}");
+                    }
+
+                    #[cfg(feature = "tracing-support")]
+                    tracing::debug!(server_name = %server_name, "MCP message processed");
+                    #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                    eprintln!("MCP message processed for {server_name}");
+                }
+                Err(e) => {
+                    #[cfg(feature = "tracing-support")]
+                    tracing::error!(error = %e, server_name = %server_name, "MCP server error");
+                    #[cfg(all(debug_assertions, not(feature = "tracing-support")))]
+                    eprintln!("MCP server error for {server_name}: {e}");
+
+                    // Send error response
+                    let error_response = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "code": -32603,
+                            "message": format!("Server error: {e}")
+                        }
+                    });
+
+                    let protocol_guard = protocol.lock().await;
+                    let response = protocol_guard.create_mcp_message_response(request_id, error_response);
+                    drop(protocol_guard);
+
+                    let _ = control_tx.send(response);
                 }
             }
         }
