@@ -33,6 +33,9 @@ async-trait = "0.1"
 # Process utilities
 which = "6.0"
 
+# JSON Schema validation
+jsonschema = "0.18"
+
 # Optional: Tracing
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
@@ -41,6 +44,7 @@ tracing-subscriber = { version = "0.3", optional = true }
 anyhow = "1.0"
 tokio-test = "0.4"
 tempfile = "3.0"
+elevenlabs_rs = "0.6"
 
 [features]
 default = []
@@ -64,9 +68,29 @@ name = "hooks_demo"
 path = "examples/hooks_demo.rs"
 
 [[example]]
+name = "hooks_advanced_demo"
+path = "examples/hooks_advanced_demo.rs"
+
+[[example]]
 name = "permissions_demo"
 path = "examples/permissions_demo.rs"
 
 [[example]]
 name = "mcp_demo"
 path = "examples/mcp_demo.rs"
+
+[[example]]
+name = "mcp_integration_demo"
+path = "examples/mcp_integration_demo.rs"
+
+[[example]]
+name = "mcp_test_basic"
+path = "examples/mcp_test_basic.rs"
+
+[[example]]
+name = "tts_notify_demo"
+path = "examples/tts_notify_demo.rs"
+
+[[example]]
+name = "tts_standalone_demo"
+path = "examples/tts_standalone_demo.rs"

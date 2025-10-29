@@ -49,8 +49,8 @@
 //! // When a hook event arrives, it will be sent to hook_rx
 //! // You can then process it and send a response
 //! tokio::spawn(async move {
-//!     while let Some((hook_id, event)) = hook_rx.recv().await {
-//!         println!("Received hook: {} {:?}", hook_id, event);
+//!     while let Some((hook_id, event, data)) = hook_rx.recv().await {
+//!         println!("Received hook: {} {:?} data: {}", hook_id, event, data);
 //!         // Process hook and create response...
 //!     }
 //! });
@@ -143,6 +143,22 @@ pub enum ControlRequest {
         /// Permission result (Allow/Deny)
         result: PermissionResult,
     },
+    /// Response to hook callback request from CLI
+    #[serde(rename = "hook_callback_response")]
+    HookCallbackResponse {
+        /// Request ID from the CLI's hook_callback request
+        id: RequestId,
+        /// Hook output data
+        output: serde_json::Value,
+    },
+    /// Response to MCP message request from CLI
+    #[serde(rename = "mcp_message_response")]
+    McpMessageResponse {
+        /// Request ID from the CLI's mcp_message request
+        id: RequestId,
+        /// JSONRPC response from SDK MCP server
+        mcp_response: serde_json::Value,
+    },
 }
 
 /// Response from CLI to SDK
@@ -174,6 +190,9 @@ pub enum ControlResponse {
         id: String,
         /// Hook event details
         event: HookEvent,
+        /// Event data (tool_name, tool_input, session_id, etc.)
+        #[serde(flatten)]
+        data: serde_json::Value,
     },
     /// Permission request from CLI
     #[serde(rename = "permission")]
@@ -182,6 +201,29 @@ pub enum ControlResponse {
         id: RequestId,
         /// Permission request details
         request: PermissionRequest,
+    },
+    /// Hook callback request from CLI to SDK
+    #[serde(rename = "hook_callback")]
+    HookCallback {
+        /// Request ID for this hook callback
+        id: RequestId,
+        /// The callback ID to invoke
+        callback_id: String,
+        /// Hook input data
+        input: serde_json::Value,
+        /// Tool use ID
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
+    },
+    /// MCP message request from CLI to SDK
+    #[serde(rename = "mcp_message")]
+    McpMessage {
+        /// Request ID for this MCP message
+        id: RequestId,
+        /// Server name to route message to
+        server_name: String,
+        /// JSONRPC message to send to SDK MCP server
+        message: serde_json::Value,
     },
 }
 
@@ -194,6 +236,20 @@ pub struct InitRequest {
     pub sdk_version: String,
     /// Client capabilities
     pub capabilities: ClientCapabilities,
+    /// Hook configurations with callback IDs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HashMap<HookEvent, Vec<HookMatcherConfig>>>,
+}
+
+/// Hook matcher configuration for CLI
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookMatcherConfig {
+    /// Tool name pattern to match (e.g., "Bash", "Write", "*")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    /// List of callback IDs for this matcher
+    #[serde(rename = "hookCallbackIds")]
+    pub hook_callback_ids: Vec<String>,
 }
 
 /// Client capabilities for negotiation
@@ -248,9 +304,13 @@ pub struct ProtocolHandler {
     /// Initialized flag
     initialized: Arc<AtomicBool>,
     /// Hook callback channel
-    hook_tx: Option<mpsc::UnboundedSender<(String, HookEvent)>>,
+    hook_tx: Option<mpsc::UnboundedSender<(String, HookEvent, serde_json::Value)>>,
     /// Permission callback channel
     permission_tx: Option<mpsc::UnboundedSender<(RequestId, PermissionRequest)>>,
+    /// Hook callback request channel (for incoming hook_callback requests from CLI)
+    hook_callback_tx: Option<mpsc::UnboundedSender<(RequestId, String, serde_json::Value, Option<String>)>>,
+    /// MCP message callback channel (for incoming mcp_message requests from CLI)
+    mcp_callback_tx: Option<mpsc::UnboundedSender<(RequestId, String, serde_json::Value)>>,
 }
 
 impl ProtocolHandler {
@@ -262,11 +322,13 @@ impl ProtocolHandler {
             initialized: Arc::new(AtomicBool::new(false)),
             hook_tx: None,
             permission_tx: None,
+            hook_callback_tx: None,
+            mcp_callback_tx: None,
         }
     }
 
     /// Set hook callback channel
-    pub fn set_hook_channel(&mut self, tx: mpsc::UnboundedSender<(String, HookEvent)>) {
+    pub fn set_hook_channel(&mut self, tx: mpsc::UnboundedSender<(String, HookEvent, serde_json::Value)>) {
         self.hook_tx = Some(tx);
     }
 
@@ -276,6 +338,32 @@ impl ProtocolHandler {
         tx: mpsc::UnboundedSender<(RequestId, PermissionRequest)>,
     ) {
         self.permission_tx = Some(tx);
+    }
+
+    /// Set hook callback request channel (for incoming hook_callback requests from CLI)
+    pub fn set_hook_callback_channel(
+        &mut self,
+        tx: mpsc::UnboundedSender<(RequestId, String, serde_json::Value, Option<String>)>,
+    ) {
+        self.hook_callback_tx = Some(tx);
+    }
+
+    /// Get hook callback channel (for sending hook callbacks)
+    pub fn get_hook_callback_channel(&self) -> Option<&mpsc::UnboundedSender<(RequestId, String, serde_json::Value, Option<String>)>> {
+        self.hook_callback_tx.as_ref()
+    }
+
+    /// Set MCP message callback channel (for incoming mcp_message requests from CLI)
+    pub fn set_mcp_callback_channel(
+        &mut self,
+        tx: mpsc::UnboundedSender<(RequestId, String, serde_json::Value)>,
+    ) {
+        self.mcp_callback_tx = Some(tx);
+    }
+
+    /// Get MCP message callback channel
+    pub fn get_mcp_callback_channel(&self) -> Option<&mpsc::UnboundedSender<(RequestId, String, serde_json::Value)>> {
+        self.mcp_callback_tx.as_ref()
     }
 
     /// Check if protocol is initialized
@@ -305,6 +393,25 @@ impl ProtocolHandler {
                 permissions: true,
                 interrupts: true,
             },
+            hooks: None,
+        }
+    }
+
+    /// Create initialization request with hooks configuration
+    pub fn create_init_request_with_hooks(
+        &self,
+        hooks_config: Option<HashMap<HookEvent, Vec<HookMatcherConfig>>>,
+    ) -> InitRequest {
+        InitRequest {
+            protocol_version: "1.0".to_string(),
+            sdk_version: crate::VERSION.to_string(),
+            capabilities: ClientCapabilities {
+                bidirectional: true,
+                hooks: true,
+                permissions: true,
+                interrupts: true,
+            },
+            hooks: hooks_config,
         }
     }
 
@@ -353,6 +460,8 @@ impl ProtocolHandler {
             ControlRequest::SendMessage { id, .. } => id.clone(),
             ControlRequest::HookResponse { id, .. } => id.clone(),
             ControlRequest::PermissionResponse { id, .. } => id.clone(),
+            ControlRequest::HookCallbackResponse { id, .. } => id.clone(),
+            ControlRequest::McpMessageResponse { id, .. } => id.clone(),
         }
     }
 
@@ -366,9 +475,9 @@ impl ProtocolHandler {
                 }
                 Ok(())
             }
-            ControlResponse::Hook { id, event } => {
+            ControlResponse::Hook { id, event, data } => {
                 if let Some(ref tx) = self.hook_tx {
-                    tx.send((id.clone(), *event))
+                    tx.send((id.clone(), *event, data.clone()))
                         .map_err(|_| ClaudeError::protocol_error("Hook channel closed"))?;
                 }
                 Ok(())
@@ -377,6 +486,20 @@ impl ProtocolHandler {
                 if let Some(ref tx) = self.permission_tx {
                     tx.send((id.clone(), request.clone()))
                         .map_err(|_| ClaudeError::protocol_error("Permission channel closed"))?;
+                }
+                Ok(())
+            }
+            ControlResponse::HookCallback { id, callback_id, input, tool_use_id } => {
+                if let Some(ref tx) = self.hook_callback_tx {
+                    tx.send((id.clone(), callback_id.clone(), input.clone(), tool_use_id.clone()))
+                        .map_err(|_| ClaudeError::protocol_error("Hook callback channel closed"))?;
+                }
+                Ok(())
+            }
+            ControlResponse::McpMessage { id, server_name, message } => {
+                if let Some(ref tx) = self.mcp_callback_tx {
+                    tx.send((id.clone(), server_name.clone(), message.clone()))
+                        .map_err(|_| ClaudeError::protocol_error("MCP callback channel closed"))?;
                 }
                 Ok(())
             }
@@ -421,6 +544,30 @@ impl ProtocolHandler {
             id: self.next_id(),
             request_id,
             result,
+        }
+    }
+
+    /// Create hook callback response
+    pub fn create_hook_callback_response(
+        &self,
+        request_id: RequestId,
+        output: serde_json::Value,
+    ) -> ControlRequest {
+        ControlRequest::HookCallbackResponse {
+            id: request_id,
+            output,
+        }
+    }
+
+    /// Create MCP message response
+    pub fn create_mcp_message_response(
+        &self,
+        request_id: RequestId,
+        mcp_response: serde_json::Value,
+    ) -> ControlRequest {
+        ControlRequest::McpMessageResponse {
+            id: request_id,
+            mcp_response,
         }
     }
 
@@ -527,6 +674,10 @@ mod tests {
         let response = ControlResponse::Hook {
             id: "hook-1".to_string(),
             event: HookEvent::PreToolUse,
+            data: serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"}
+            }),
         };
 
         // Should not error, just no-op
@@ -641,6 +792,10 @@ mod tests {
         let resp = ControlResponse::Hook {
             id: "hook-1".to_string(),
             event: HookEvent::PreToolUse,
+            data: serde_json::json!({
+                "tool_name": "Read",
+                "tool_input": {"path": "/test"}
+            }),
         };
         let msg = ControlMessage::Response(resp);
         assert!(handler.serialize_message(&msg).is_ok());

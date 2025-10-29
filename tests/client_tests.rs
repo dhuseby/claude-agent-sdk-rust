@@ -114,8 +114,8 @@ async fn test_hook_receiver() {
     // This might timeout if no hooks are triggered, which is okay for this test
     // The important part is that the channel works
     match hook_result {
-        Ok(Some((hook_id, event))) => {
-            println!("Received hook: {hook_id} {event:?}");
+        Ok(Some((hook_id, event, data))) => {
+            println!("Received hook: {hook_id} {event:?} with data: {data}");
             // Could respond to hook
             // client.respond_to_hook(hook_id, response).await.unwrap();
         }
