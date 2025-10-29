@@ -637,7 +637,7 @@ pub enum SystemPrompt {
 // ============================================================================
 
 /// Agent definition configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentDefinition {
     /// Agent description
     pub description: String,
@@ -826,6 +826,77 @@ impl ClaudeAgentOptionsBuilder {
         self
     }
 
+    /// Set custom agent definitions
+    ///
+    /// This method replaces any previously configured agents. To add agents
+    /// incrementally, use `add_agent()` instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `agents` - HashMap of agent name to AgentDefinition
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use claude_agent_sdk::{ClaudeAgentOptions, AgentDefinition};
+    ///
+    /// let mut agents = HashMap::new();
+    /// agents.insert("reviewer".to_string(), AgentDefinition {
+    ///     description: "Code reviewer".to_string(),
+    ///     prompt: "Review code thoroughly".to_string(),
+    ///     tools: Some(vec!["Read".to_string()]),
+    ///     model: Some("sonnet".to_string()),
+    /// });
+    ///
+    /// let options = ClaudeAgentOptions::builder()
+    ///     .agents(agents)
+    ///     .build();
+    /// ```
+    pub fn agents(mut self, agents: HashMap<String, AgentDefinition>) -> Self {
+        self.options.agents = Some(agents);
+        self
+    }
+
+    /// Add a custom agent definition
+    ///
+    /// This method adds a single agent to the configuration. Multiple calls
+    /// can be chained to add multiple agents. If an agent with the same name
+    /// already exists, it will be replaced.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The agent name/identifier
+    /// * `agent` - The agent definition
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use claude_agent_sdk::{ClaudeAgentOptions, AgentDefinition};
+    ///
+    /// let options = ClaudeAgentOptions::builder()
+    ///     .add_agent("code-reviewer", AgentDefinition {
+    ///         description: "Reviews code for best practices".to_string(),
+    ///         prompt: "You are a code reviewer...".to_string(),
+    ///         tools: Some(vec!["Read".to_string(), "Grep".to_string()]),
+    ///         model: Some("sonnet".to_string()),
+    ///     })
+    ///     .add_agent("tester", AgentDefinition {
+    ///         description: "Runs tests".to_string(),
+    ///         prompt: "You are a testing expert...".to_string(),
+    ///         tools: Some(vec!["Bash".to_string()]),
+    ///         model: None,
+    ///     })
+    ///     .build();
+    /// ```
+    pub fn add_agent(mut self, name: impl Into<String>, agent: AgentDefinition) -> Self {
+        self.options
+            .agents
+            .get_or_insert_with(HashMap::new)
+            .insert(name.into(), agent);
+        self
+    }
+
     /// Build the options
     pub fn build(self) -> ClaudeAgentOptions {
         self.options
@@ -848,5 +919,129 @@ impl From<&str> for SystemPrompt {
 impl From<SystemPromptPreset> for SystemPrompt {
     fn from(preset: SystemPromptPreset) -> Self {
         SystemPrompt::Preset(preset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_builder_agents() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "reviewer".to_string(),
+            AgentDefinition {
+                description: "Code reviewer".to_string(),
+                prompt: "Review code".to_string(),
+                tools: Some(vec!["Read".to_string()]),
+                model: Some("sonnet".to_string()),
+            },
+        );
+
+        let options = ClaudeAgentOptions::builder()
+            .agents(agents.clone())
+            .build();
+
+        assert_eq!(options.agents, Some(agents));
+    }
+
+    #[test]
+    fn test_builder_add_agent() {
+        let agent = AgentDefinition {
+            description: "Code reviewer".to_string(),
+            prompt: "Review code".to_string(),
+            tools: Some(vec!["Read".to_string()]),
+            model: Some("sonnet".to_string()),
+        };
+
+        let options = ClaudeAgentOptions::builder()
+            .add_agent("reviewer", agent.clone())
+            .build();
+
+        assert!(options.agents.is_some());
+        assert_eq!(options.agents.unwrap().get("reviewer"), Some(&agent));
+    }
+
+    #[test]
+    fn test_builder_add_multiple_agents() {
+        let reviewer = AgentDefinition {
+            description: "Code reviewer".to_string(),
+            prompt: "Review code".to_string(),
+            tools: Some(vec!["Read".to_string()]),
+            model: Some("sonnet".to_string()),
+        };
+
+        let tester = AgentDefinition {
+            description: "Test runner".to_string(),
+            prompt: "Run tests".to_string(),
+            tools: Some(vec!["Bash".to_string()]),
+            model: None,
+        };
+
+        let options = ClaudeAgentOptions::builder()
+            .add_agent("reviewer", reviewer.clone())
+            .add_agent("tester", tester.clone())
+            .build();
+
+        let agents = options.agents.unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents.get("reviewer"), Some(&reviewer));
+        assert_eq!(agents.get("tester"), Some(&tester));
+    }
+
+    #[test]
+    fn test_builder_agents_mixed() {
+        let mut initial_agents = HashMap::new();
+        initial_agents.insert(
+            "reviewer".to_string(),
+            AgentDefinition {
+                description: "Code reviewer".to_string(),
+                prompt: "Review code".to_string(),
+                tools: None,
+                model: None,
+            },
+        );
+
+        let tester = AgentDefinition {
+            description: "Test runner".to_string(),
+            prompt: "Run tests".to_string(),
+            tools: None,
+            model: None,
+        };
+
+        let options = ClaudeAgentOptions::builder()
+            .agents(initial_agents)
+            .add_agent("tester", tester)
+            .build();
+
+        let agents = options.agents.unwrap();
+        assert_eq!(agents.len(), 2);
+    }
+
+    #[test]
+    fn test_builder_agent_replacement() {
+        let agent_v1 = AgentDefinition {
+            description: "Version 1".to_string(),
+            prompt: "Old prompt".to_string(),
+            tools: None,
+            model: None,
+        };
+
+        let agent_v2 = AgentDefinition {
+            description: "Version 2".to_string(),
+            prompt: "New prompt".to_string(),
+            tools: None,
+            model: None,
+        };
+
+        let options = ClaudeAgentOptions::builder()
+            .add_agent("test", agent_v1)
+            .add_agent("test", agent_v2.clone())
+            .build();
+
+        let agents = options.agents.unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents.get("test"), Some(&agent_v2));
     }
 }
