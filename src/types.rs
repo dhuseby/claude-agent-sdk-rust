@@ -604,6 +604,12 @@ pub enum Message {
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
     },
+    /// Rate limit event emitted by Claude CLI (v2.1.45+)
+    RateLimitEvent {
+        /// Rate limit details
+        #[serde(flatten)]
+        data: serde_json::Value,
+    },
 }
 
 // ============================================================================
