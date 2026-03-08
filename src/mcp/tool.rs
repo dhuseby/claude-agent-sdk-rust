@@ -5,8 +5,9 @@
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::sync::Arc;
+use jsonschema::JSONSchema;
 
-use crate::error::Result;
+use crate::error::{ClaudeError, Result};
 use super::ToolHandler;
 
 /// A tool that can be invoked by Claude
@@ -55,6 +56,8 @@ pub struct SdkMcpTool {
     pub(crate) description: String,
     /// JSON schema for input validation
     pub(crate) input_schema: serde_json::Value,
+    /// Pre-compiled JSON schema validator
+    pub(crate) compiled_schema: Option<JSONSchema>,
     /// Async handler function
     pub(crate) handler: ToolHandler,
 }
@@ -95,10 +98,14 @@ impl SdkMcpTool {
         F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ToolResult>> + Send + 'static,
     {
+        // Pre-compile JSON schema for validation
+        let compiled_schema = JSONSchema::compile(&input_schema).ok();
+
         Self {
             name: name.into(),
             description: description.into(),
             input_schema,
+            compiled_schema,
             handler: Arc::new(move |input| Box::pin(handler(input))),
         }
     }
@@ -121,6 +128,19 @@ impl SdkMcpTool {
     /// Invoke the tool with the given input
     pub async fn invoke(&self, input: serde_json::Value) -> Result<ToolResult> {
         (self.handler)(input).await
+    }
+
+    /// Validate input against the tool's JSON schema
+    ///
+    /// Returns Ok(()) if validation succeeds, or an error describing what failed.
+    pub fn validate_input(&self, input: &serde_json::Value) -> Result<()> {
+        if let Some(schema) = &self.compiled_schema {
+            if let Err(errors) = schema.validate(input) {
+                let error_messages: Vec<String> = errors.map(|e| e.to_string()).collect();
+                return Err(ClaudeError::ValidationError(error_messages.join(", ")));
+            }
+        }
+        Ok(())
     }
 
     /// Convert tool to MCP tools/list format

@@ -46,6 +46,27 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_rate_limit_event() {
+        let data = json!({
+            "type": "rate_limit_event",
+            "requests_limit": 100,
+            "requests_remaining": 0,
+            "retry_after_ms": 5000
+        });
+
+        let result = parse_message(data);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            Message::RateLimitEvent { data } => {
+                assert_eq!(data["requests_limit"], 100);
+                assert_eq!(data["requests_remaining"], 0);
+                assert_eq!(data["retry_after_ms"], 5000);
+            }
+            _ => panic!("Expected RateLimitEvent variant"),
+        }
+    }
+
+    #[test]
     fn test_parse_invalid_message() {
         let data = json!({
             "type": "invalid_type",

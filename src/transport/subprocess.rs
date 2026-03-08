@@ -144,12 +144,37 @@ impl SubprocessTransport {
     fn build_command(&self) -> Command {
         let mut cmd = Command::new(&self.cli_path);
 
-        // Always use --print for non-interactive mode to avoid terminal manipulation
-        cmd.arg("--print");
+        // Use streaming mode when:
+        // 1. Prompt is Stream (interactive client using send_message)
+        // 2. Control protocol features are enabled (hooks/permissions/SDK MCP)
+        let has_sdk_mcp_servers = match &self.options.mcp_servers {
+            crate::types::McpServers::Dict(servers) => {
+                servers.values().any(|config| matches!(config, crate::types::McpServerConfig::Sdk(_)))
+            }
+            _ => false,
+        };
 
-        cmd.arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose");
+        let needs_control_protocol = self.options.hooks.is_some()
+            || self.options.can_use_tool.is_some()
+            || has_sdk_mcp_servers;
+
+        // Stream input ALWAYS needs streaming mode (used by ClaudeSDKClient.send_message)
+        let needs_streaming_mode = matches!(self.prompt, PromptInput::Stream) || needs_control_protocol;
+
+        if needs_streaming_mode {
+            // Streaming mode: required for interactive input and bidirectional control protocol
+            cmd.arg("--input-format").arg("stream-json");
+            cmd.arg("--output-format").arg("stream-json");
+        } else {
+            // Non-interactive print mode: simpler for one-shot queries
+            cmd.arg("--print");
+            cmd.arg("--output-format").arg("stream-json");
+        }
+
+        // Note: --verbose is REQUIRED when using --output-format=stream-json
+        // This applies to BOTH streaming and print modes
+        // Stderr output is handled by the stderr task to prevent TUI corruption
+        cmd.arg("--verbose");
 
         // System prompt
         if let Some(ref system_prompt) = self.options.system_prompt {
@@ -298,12 +323,15 @@ impl SubprocessTransport {
         // Prompt handling based on mode
         match &self.prompt {
             PromptInput::Stream => {
-                // Streaming mode: use --input-format stream-json
-                cmd.arg("--input-format").arg("stream-json");
+                // Stream mode is handled by streaming mode flags above
+                // No additional args needed - messages sent via stdin
             }
             PromptInput::String(s) => {
-                // String mode: pass the prompt as an argument after --
-                cmd.arg("--").arg(s);
+                if !needs_streaming_mode {
+                    // Print mode: pass the prompt as an argument after --
+                    cmd.arg("--").arg(s);
+                }
+                // In streaming mode, prompt will be sent via stdin
             }
         }
 
@@ -422,7 +450,7 @@ impl Transport for SubprocessTransport {
             .ok_or_else(|| ClaudeError::connection("Failed to get stderr handle"))?;
 
         // Spawn task to consume stderr to prevent blocking
-        // We forward it to parent stderr for visibility
+        // Log stderr to eprintln! (goes to stderr but won't corrupt TUI if properly handled)
         let stderr_task = tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
             let mut stderr = stderr;
@@ -431,9 +459,16 @@ impl Transport for SubprocessTransport {
             loop {
                 match stderr.read(&mut buffer).await {
                     Ok(0) => break, // EOF
-                    Ok(n) => {
-                        // Forward stderr to parent's stderr
-                        let _ = std::io::Write::write_all(&mut std::io::stderr(), &buffer[..n]);
+                    Ok(_n) => {
+                        // In debug mode, log stderr via eprintln! for diagnostics
+                        // In release mode with TUI apps, this can be redirected to a log file
+                        #[cfg(debug_assertions)]
+                        {
+                            if let Ok(text) = std::str::from_utf8(&buffer[.._n]) {
+                                eprintln!("[Claude CLI stderr]: {}", text);
+                            }
+                        }
+                        // In release mode, discard to prevent TUI corruption
                     }
                     Err(_) => break,
                 }
@@ -514,8 +549,9 @@ impl Transport for SubprocessTransport {
                 let mut line = String::new();
 
                 // Add timeout to read_line to prevent hanging
+                // Increased to 10 minutes for complex suborchestrator operations
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(600),
                     stdout.read_line(&mut line)
                 ).await {
                     Ok(Ok(0)) => break, // EOF
@@ -545,9 +581,32 @@ impl Transport for SubprocessTransport {
                         match serde_json::from_str::<serde_json::Value>(&json_buffer) {
                             Ok(data) => {
                                 json_buffer.clear();
-                                if tx.send(Ok(data)).is_err() {
-                                    // Receiver dropped, stop reading
-                                    break;
+
+                                // Filter out verbose debug output - only send valid message envelopes
+                                // Valid messages must have a "type" field indicating message type
+                                if let Some(msg_type) = data.get("type").and_then(|v| v.as_str()) {
+                                    // Skip debug/verbose system messages that aren't part of conversation
+                                    let should_skip = if msg_type == "system" {
+                                        // Allow system messages but skip verbose debug subtypes
+                                        if let Some(subtype) = data.get("subtype").and_then(|v| v.as_str()) {
+                                            matches!(subtype, "mcp_server_list" | "tools_list" | "debug")
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    };
+
+                                    if !should_skip {
+                                        if tx.send(Ok(data)).is_err() {
+                                            // Receiver dropped, stop reading
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    // No "type" field - this is raw debug output from verbose mode, discard it
+                                    #[cfg(debug_assertions)]
+                                    eprintln!("[Filtered verbose JSON without type field]: {}", json_buffer.chars().take(100).collect::<String>());
                                 }
                             }
                             Err(_) => {
